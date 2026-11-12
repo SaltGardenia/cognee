@@ -13,6 +13,7 @@ from .google_calendar import build_calendar_service_from_access_token, google_ca
 from .google_drive import build_drive_service_from_access_token, google_drive_source
 from .linear import build_linear_service, linear_source
 from .notion import notion_source
+from .nuget import nuget_source
 from .obsidian import obsidian_source
 from .onenote import list_onenote_notebooks, onenote_source
 
@@ -31,6 +32,7 @@ __all__ = [
     "linear_source",
     "list_onenote_notebooks",
     "notion_source",
+    "nuget_source",
     "obsidian_source",
     "onenote_source",
 ]
