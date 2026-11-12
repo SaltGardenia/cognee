@@ -15,6 +15,7 @@ from .linear import build_linear_service, linear_source
 from .notion import notion_source
 from .obsidian import obsidian_source
 from .onenote import list_onenote_notebooks, onenote_source
+from .packagist import packagist_source
 
 __all__ = [
     "apollo_source",
