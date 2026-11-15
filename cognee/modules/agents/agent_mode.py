@@ -4,7 +4,9 @@ When COGNEE_AGENT_MODE=true, the server tracks how many agent connections
 have registered via the /register endpoint. A background watchdog thread
 starts on the first registration and checks every 60 seconds whether
 any connections remain. If the count drops to zero the watchdog sends
-SIGTERM, shutting the server down gracefully.
+SIGTERM, shutting the server down gracefully. A graceful shutdown that
+hangs keeps receiving SIGTERM for a grace period, after which the
+watchdog force-kills the process, so the server cannot idle forever.
 
 This is designed for ephemeral deployments where an external
 orchestrator spins up a Cognee server for one or more agents. Each
@@ -36,6 +38,11 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
+_WATCHDOG_INTERVAL_SECONDS = 60.0
+# Empty ticks that may spend on graceful SIGTERM attempts before the watchdog
+# force-kills a process whose shutdown is hung (#6018).
+_SHUTDOWN_GRACE_TICKS = 3
+
 
 def set_agent_mode(enabled: bool) -> None:
     os.environ["COGNEE_AGENT_MODE"] = str(enabled).lower()
@@ -49,20 +56,63 @@ _lock = threading.Lock()
 _active_count = 0
 _active_connection_ids: set[str] = set()
 _watchdog_started = False
+# Consecutive empty watchdog ticks that already asked for a graceful shutdown.
+# A graceful exit tears the process down between ticks; reaching the grace
+# limit with the process still alive means uvicorn's shutdown is hung.
+_shutdown_attempts = 0
 
 
 def _shutdown_server():
-    logger.info("No active agent connections remaining — shutting down server")
-    os.kill(os.getpid(), signal.SIGTERM)
+    """Ask this process to exit, escalating when graceful shutdown hangs.
+
+    The first tick sends SIGTERM; while the grace limit is not reached it
+    warns and sends SIGTERM again, and past it the process is force-killed
+    (``SIGKILL``, or ``os._exit`` where there is no SIGKILL), so a hung
+    shutdown cannot leave the server idling forever (#6018).
+    """
+    global _shutdown_attempts
+
+    with _lock:
+        _shutdown_attempts += 1
+        attempts = _shutdown_attempts
+
+    if attempts == 1:
+        logger.info("No active agent connections remaining — shutting down server")
+        os.kill(os.getpid(), signal.SIGTERM)
+        return
+    if attempts <= _SHUTDOWN_GRACE_TICKS:
+        logger.warning(
+            "Graceful shutdown has not completed after %d SIGTERM attempts; retrying "
+            "(force kill after %d ticks)",
+            attempts - 1,
+            _SHUTDOWN_GRACE_TICKS,
+        )
+        os.kill(os.getpid(), signal.SIGTERM)
+        return
+    logger.warning(
+        "Graceful shutdown hung for over %d s despite %d SIGTERM attempts — force killing",
+        int((_SHUTDOWN_GRACE_TICKS + 1) * _WATCHDOG_INTERVAL_SECONDS),
+        attempts - 1,
+    )
+    if hasattr(signal, "SIGKILL"):
+        os.kill(os.getpid(), signal.SIGKILL)
+    else:
+        os._exit(1)
 
 
 def _watchdog():
-    timer = threading.Timer(60.0, _watchdog)
+    global _shutdown_attempts
+
+    timer = threading.Timer(_WATCHDOG_INTERVAL_SECONDS, _watchdog)
     timer.daemon = True
     timer.start()
 
     with _lock:
         count = _active_count
+        if count > 0:
+            # Activity while a shutdown is pending: the server is wanted again,
+            # so the escalation counter starts over.
+            _shutdown_attempts = 0
 
     if count <= 0:
         _shutdown_server()
@@ -85,7 +135,7 @@ async def register_agent(user: User, request: RegisterAgentRequest) -> AgentConn
 
         if is_agent_mode_enabled() and not _watchdog_started:
             _watchdog_started = True
-            timer = threading.Timer(60.0, _watchdog)
+            timer = threading.Timer(_WATCHDOG_INTERVAL_SECONDS, _watchdog)
             timer.daemon = True
             timer.start()
             logger.info("Agent mode watchdog started")
